@@ -56,7 +56,7 @@ def get_aws_session(profile):
         return None
 
 
-def get_temporary_credentials(profile, mfa_serial, mfa_token, duration=3600):
+def get_temporary_credentials(profile, mfa_serial, mfa_token, duration=129600):
     """
     Fetches temporary credentials.
     """
@@ -100,20 +100,38 @@ def connect_to_cluster(cluster_name, region, profile):
     subprocess.run(['aws', 'eks', 'update-kubeconfig', '--name', cluster_name, '--region', region, '--profile', profile])
 
 
+def create_or_update_profile(config, profile_key):
+    """
+    Creates or updates the specified AWS profile in the config file.
+    """
+    if not config.has_section(profile_key):
+        config.add_section(profile_key)
+    config.set(profile_key, 'profile_timestamp', str(int(time.time())))
+
+    with open(os.path.expanduser('~/.aws/config'), 'w') as configfile:
+        config.write(configfile)
+
+
 def read_profile_timestamp(profile):
     """
     Reads the timestamp from the specified AWS profile in the config file.
+    If the profile does not exist, it creates the profile and sets a new timestamp.
     """
     config_file_path = os.path.expanduser('~/.aws/config')
     config = configparser.ConfigParser()
     config.read(config_file_path)
 
     profile_key = 'profile ' + profile if not profile.startswith('profile ') else profile
+
     try:
+        if not config.has_section(profile_key):
+            create_or_update_profile(config, profile_key)
+
         return int(config.get(profile_key, 'profile_timestamp'))
     except (configparser.NoSectionError, configparser.NoOptionError) as e:
         logging.error(f"Error reading timestamp for profile '{profile}': {e}")
-        return None
+        create_or_update_profile(config, profile_key)
+        return int(time.time())
 
 
 def main(environment):
@@ -131,7 +149,7 @@ def main(environment):
     profile_timestamp = read_profile_timestamp(mfa_profile)
     current_time = int(time.time())
 
-    if profile_timestamp and current_time - profile_timestamp < 3600:
+    if profile_timestamp and current_time - profile_timestamp < 129600:
         logging.info("Using existing credentials.")
         connect_to_cluster(aws_config['cluster_name'], aws_config['region'], mfa_profile)
         return
