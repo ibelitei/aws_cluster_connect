@@ -1,139 +1,240 @@
 # credentials.py
-import time
-import logging
-from datetime import datetime
-from typing import Dict
-import boto3
-import configparser
+"""Credential validity, temporary-credential acquisition, and secure writing.
+
+Fail-closed cache model: cached credentials are reused ONLY when every check
+passes -- complete credential fields, a matching non-secret target fingerprint,
+a present and future expiration, a well-formed timestamp, and the duration
+bound. Any missing/malformed/mismatched value refreshes. Nothing here logs
+credential material, tokens, or raw provider stderr.
+"""
+
 import os
+import time
+import configparser
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
-from botocore.exceptions import ProfileNotFound
-from aws_config import read_profile_timestamp, create_or_update_profile
 from settings import ROLE_MAX_DURATION, USER_MAX_DURATION
+from aws_config import profile_key, credentials_file_path
+from errors import StsError, CredentialWriteError, ConfigError
 
-# In-memory cache for temporary credentials
-credentials_cache: Dict[str, tuple[Dict[str, str], datetime]] = {}
+_REQUIRED_CRED_FIELDS = ("aws_access_key_id", "aws_secret_access_key", "aws_session_token")
 
-def get_aws_session(profile: str):
-    """
-    Attempts to create a boto3 Session for a given AWS CLI profile.
-    Returns None if the profile is not found.
-    """
-    try:
-        return boto3.Session(profile_name=profile)
-    except ProfileNotFound:
-        logging.error(f"[get_aws_session] Profile '{profile}' not found.")
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_expiration(raw: str) -> Optional[datetime]:
+    """Parse a stored ISO-8601 expiration into a tz-aware datetime, or None."""
+    if not raw:
         return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _credentials_complete(profile: str) -> bool:
+    """True only when the shared credentials file has all three temp fields set."""
+    path = credentials_file_path()
+    if not os.path.isfile(path):
+        return False
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path)
+    except configparser.Error:
+        return False
+    if not parser.has_section(profile):
+        return False
+    for field in _REQUIRED_CRED_FIELDS:
+        value = parser.get(profile, field, fallback="")
+        if not value or not value.strip():
+            return False
+    return True
+
 
 def credentials_are_valid(
-        config: configparser.ConfigParser,
-        profile: str,
-        is_role_based: bool
+    config: configparser.ConfigParser,
+    profile: str,
+    is_role_based: bool,
+    expected_fingerprint: str,
 ) -> bool:
+    """Fail-closed validity for cached credentials of ``profile``.
+
+    Returns True only when ALL hold:
+      * the config section exists and 'profile_timestamp' is present + numeric;
+      * 'credential_fingerprint' is present and equals ``expected_fingerprint``;
+      * 'credential_expiration' is present, parseable, and in the future;
+      * the shared credentials file has complete temp credential fields;
+      * elapsed time is within the role/user duration bound.
+    A missing timestamp/profile is INVALID (never treated as newly valid).
     """
-    Determines if the credentials for 'profile' are still valid
-    based on a custom maximum duration:
-      - Roles: 1 hour (ROLE_MAX_DURATION)
-      - IAM user: 36 hours (USER_MAX_DURATION)
-    We read the 'profile_timestamp' from the config, compare with current time.
-    """
+    key = profile_key(profile)
+    if not config.has_section(key):
+        return False
+
+    ts_raw = config.get(key, "profile_timestamp", fallback=None)
+    if ts_raw is None:
+        return False
+    try:
+        timestamp = int(str(ts_raw).strip())
+    except (TypeError, ValueError):
+        return False
+
+    fingerprint = config.get(key, "credential_fingerprint", fallback=None)
+    if not fingerprint or fingerprint != expected_fingerprint:
+        return False
+
+    expiration = _parse_expiration(config.get(key, "credential_expiration", fallback=""))
+    if expiration is None or _now_utc() >= expiration:
+        return False
+
+    if not _credentials_complete(profile):
+        return False
+
     max_valid_duration = ROLE_MAX_DURATION if is_role_based else USER_MAX_DURATION
-    profile_timestamp = read_profile_timestamp(config, profile)
-    current_time = int(time.time())
-    elapsed = current_time - profile_timestamp
+    if int(time.time()) - timestamp >= max_valid_duration:
+        return False
 
-    logging.debug(
-        f"[credentials_are_valid] Profile '{profile}' - Elapsed: {elapsed}s / Allowed: {max_valid_duration}s"
-    )
+    return True
 
-    return elapsed < max_valid_duration
+
+def _expiration_iso(credentials: Dict[str, object]) -> str:
+    """Normalise a credentials Expiration (datetime or str) to ISO-8601 UTC."""
+    expiration = credentials.get("Expiration")
+    if isinstance(expiration, datetime):
+        dt = expiration if expiration.tzinfo else expiration.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).isoformat()
+    parsed = _parse_expiration(str(expiration)) if expiration is not None else None
+    if parsed is None:
+        raise StsError("STS response is missing a usable credential expiration")
+    return parsed.isoformat()
+
 
 def get_temporary_credentials(
-        config: configparser.ConfigParser,
-        profile: str,
-        mfa_serial: str,
-        mfa_token: str,
-        duration: int = USER_MAX_DURATION
-) -> Dict[str, str]:
+    config: configparser.ConfigParser,
+    profile: str,
+    mfa_serial: str,
+    mfa_token: str,
+    duration: int = USER_MAX_DURATION,
+) -> Dict[str, object]:
+    """Fetch temporary credentials via STS (assume_role or get_session_token).
+
+    Any botocore ClientError (e.g. AccessDenied, invalid MFA) is converted to a
+    concise StsError carrying only the AWS error CODE -- never a traceback, keys,
+    the OTP, or raw stderr. Returns a dict with AccessKeyId/SecretAccessKey/
+    SessionToken/Expiration.
     """
-    Fetches temporary AWS credentials.
-      - If the profile is role-based (has role_arn), calls sts.assume_role.
-      - Otherwise, calls sts.get_session_token (classic IAM user + MFA).
-    'duration' can be up to 36 hours, but for roles we limit to ROLE_MAX_DURATION.
-    Returns a dict of new credentials: {AccessKeyId, SecretAccessKey, SessionToken, Expiration}.
-    """
-    now = datetime.now()
+    import boto3
+    from botocore.exceptions import ClientError, BotoCoreError, ProfileNotFound
 
-    # Return cached credentials if still valid in memory
-    if profile in credentials_cache and now < credentials_cache[profile][1]:
-        logging.debug(f"[get_temporary_credentials] Using cached credentials for '{profile}'.")
-        return credentials_cache[profile][0]
+    key = profile_key(profile)
+    is_role_based = config.has_section(key) and config.has_option(key, "role_arn")
 
-    profile_key = f'profile {profile}' if not profile.startswith('profile ') else profile
-    is_role_based = config.has_section(profile_key) and config.has_option(profile_key, 'role_arn')
+    try:
+        if is_role_based:
+            role_arn = config.get(key, "role_arn")
+            source_profile = config.get(key, "source_profile")
+            role_duration = min(duration, ROLE_MAX_DURATION)
 
-    if is_role_based:
-        logging.info(f"[get_temporary_credentials] Detected role_arn in profile '{profile}'. Using assume_role with MFA.")
-        role_arn = config.get(profile_key, 'role_arn')
-        source_profile = config.get(profile_key, 'source_profile')
+            source_session = boto3.Session(profile_name=source_profile)
+            source_creds = source_session.get_credentials()
+            if source_creds is None:
+                raise StsError("source profile has no resolvable credentials")
+            frozen = source_creds.get_frozen_credentials()
+            sts_client = boto3.client(
+                "sts",
+                aws_access_key_id=frozen.access_key,
+                aws_secret_access_key=frozen.secret_key,
+                aws_session_token=frozen.token,
+            )
+            response = sts_client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName=f"{profile}-session",
+                DurationSeconds=role_duration,
+                SerialNumber=mfa_serial,
+                TokenCode=mfa_token,
+            )
+        else:
+            session = boto3.Session(profile_name=profile)
+            base_creds = session.get_credentials()
+            if base_creds is None:
+                raise StsError("profile has no resolvable base credentials")
+            frozen = base_creds.get_frozen_credentials()
+            sts_client = boto3.client(
+                "sts",
+                aws_access_key_id=frozen.access_key,
+                aws_secret_access_key=frozen.secret_key,
+            )
+            response = sts_client.get_session_token(
+                DurationSeconds=duration,
+                SerialNumber=mfa_serial,
+                TokenCode=mfa_token,
+            )
+    except ProfileNotFound as exc:
+        raise ConfigError(f"AWS profile not found: {exc.args and exc.args[0] or 'unknown'}") from None
+    except ClientError as exc:
+        code = "Unknown"
+        try:
+            code = exc.response["Error"]["Code"]
+        except (AttributeError, KeyError, TypeError):
+            pass
+        raise StsError(f"STS request failed ({code})") from None
+    except BotoCoreError as exc:
+        raise StsError(f"STS request failed ({type(exc).__name__})") from None
 
-        # Limit role duration
-        role_duration = min(duration, ROLE_MAX_DURATION)
+    credentials = (response or {}).get("Credentials")
+    if not isinstance(credentials, dict):
+        raise StsError("STS response contained no Credentials")
+    for field in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"):
+        if not credentials.get(field):
+            raise StsError("STS response was missing required credential fields")
+    return credentials
 
-        source_session = boto3.Session(profile_name=source_profile)
-        source_creds = source_session.get_credentials().get_frozen_credentials()
 
-        sts_client = boto3.client(
-            'sts',
-            aws_access_key_id=source_creds.access_key,
-            aws_secret_access_key=source_creds.secret_key,
-            aws_session_token=source_creds.token
-        )
-        response = sts_client.assume_role(
-            RoleArn=role_arn,
-            RoleSessionName=f"{profile}-session",
-            DurationSeconds=role_duration,
-            SerialNumber=mfa_serial,
-            TokenCode=mfa_token
-        )
-        new_credentials = response['Credentials']
-        credentials_cache[profile] = (new_credentials, new_credentials['Expiration'])
-        return new_credentials
-    else:
-        # Classic IAM user
-        session = get_aws_session(profile)
-        if not session:
-            logging.error(f"[get_temporary_credentials] Could not create session for profile '{profile}'.")
-            return {}
+def configure_aws_credentials(
+    profile: str,
+    credentials: Dict[str, object],
+    *,
+    fingerprint: str,
+) -> None:
+    """Persist temporary credentials + non-secret validity metadata.
 
-        base_creds = session.get_credentials().get_frozen_credentials()
-        sts_client = boto3.client(
-            'sts',
-            aws_access_key_id=base_creds.access_key,
-            aws_secret_access_key=base_creds.secret_key
-        )
-        response = sts_client.get_session_token(
-            DurationSeconds=duration,
-            SerialNumber=mfa_serial,
-            TokenCode=mfa_token
-        )
-        new_credentials = response['Credentials']
-        credentials_cache[profile] = (new_credentials, new_credentials['Expiration'])
-        return new_credentials
-
-def configure_aws_credentials(profile: str, credentials: Dict[str, str]) -> None:
-    """
-    Writes the temporary credentials into the specified AWS CLI profile
-    in ~/.aws/credentials. Also updates 'profile_timestamp' for custom validity checks.
+    Writes the three credential fields to the shared credentials file and, into
+    the config profile, the target fingerprint, the credential expiration, and a
+    fresh timestamp -- all via ``aws configure set`` with a fixed argument
+    vector. Any non-zero write fails closed with CredentialWriteError (no
+    traceback, no secret material logged).
     """
     import subprocess
 
-    logging.debug(f"[configure_aws_credentials] Writing creds to profile '{profile}'.")
-    commands = [
-        ['aws', 'configure', 'set', 'aws_access_key_id', credentials['AccessKeyId'], '--profile', profile],
-        ['aws', 'configure', 'set', 'aws_secret_access_key', credentials['SecretAccessKey'], '--profile', profile],
-        ['aws', 'configure', 'set', 'aws_session_token', credentials['SessionToken'], '--profile', profile],
-        ['aws', 'configure', 'set', 'profile_timestamp', str(int(time.time())), '--profile', profile]
+    expiration_iso = _expiration_iso(credentials)
+    secret_commands = [
+        ["aws", "configure", "set", "aws_access_key_id", str(credentials["AccessKeyId"]), "--profile", profile],
+        ["aws", "configure", "set", "aws_secret_access_key", str(credentials["SecretAccessKey"]), "--profile", profile],
+        ["aws", "configure", "set", "aws_session_token", str(credentials["SessionToken"]), "--profile", profile],
     ]
-    for cmd in commands:
-        subprocess.run(cmd)
+    meta_commands = [
+        ["aws", "configure", "set", "profile_timestamp", str(int(time.time())), "--profile", profile],
+        ["aws", "configure", "set", "credential_fingerprint", fingerprint, "--profile", profile],
+        ["aws", "configure", "set", "credential_expiration", expiration_iso, "--profile", profile],
+    ]
+
+    # Describe each command WITHOUT its argument values so secrets never reach logs.
+    labels = [
+        "aws_access_key_id", "aws_secret_access_key", "aws_session_token",
+        "profile_timestamp", "credential_fingerprint", "credential_expiration",
+    ]
+    for label, cmd in zip(labels, secret_commands + meta_commands):
+        proc = subprocess.run(cmd, capture_output=True)
+        if proc.returncode != 0:
+            raise CredentialWriteError(
+                f"failed to write '{label}' for profile '{profile}' (exit {proc.returncode})"
+            )
