@@ -1,0 +1,2 @@
+# Runtime dependencies for the AWS/EKS connection script.
+boto3>=1.26
