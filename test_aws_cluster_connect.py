@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 import types
 import unittest
 from argparse import Namespace
@@ -47,6 +48,20 @@ _botocore_exc.ProfileNotFound = _ProfileNotFound
 _botocore.exceptions = _botocore_exc
 sys.modules.setdefault("botocore", _botocore)
 sys.modules.setdefault("botocore.exceptions", _botocore_exc)
+
+# botocore.config.Config stand-in: records the kwargs (connect_timeout/read_timeout/retries)
+# so a test can assert the bounded SDK settings without importing the real SDK.
+_botocore_config = types.ModuleType("botocore.config")
+
+
+class _Config:
+    def __init__(self, **kwargs):
+        self.kwargs = dict(kwargs)
+
+
+_botocore_config.Config = _Config
+_botocore.config = _botocore_config
+sys.modules.setdefault("botocore.config", _botocore_config)
 
 import main as main_mod          # noqa: E402
 import credentials as creds_mod  # noqa: E402
@@ -375,9 +390,9 @@ class PersistedExpirationReuseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "credentials")
             _write_credentials_file(path, "env2auth", "not-a-timestamp")
-            before = open(path, encoding="utf-8").read()
+            before = Path(path).read_text(encoding="utf-8")
             creds_mod.credentials_are_valid("env2auth", credentials_path=path)
-            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), before)
             self.assertEqual(os.listdir(d), ["credentials"])  # no temp/repair artifacts
 
 
@@ -471,7 +486,7 @@ class CredentialsFileWriterTests(unittest.TestCase):
             link = os.path.join(d, "credentials")
             os.symlink(real, link)
             self.assertFalse(creds_mod.configure_aws_credentials("env2auth", _good_creds(), credentials_path=link))
-            self.assertEqual(open(real, encoding="utf-8").read(), original)
+            self.assertEqual(Path(real).read_text(encoding="utf-8"), original)
 
     def test_non_regular_target_rejected(self):
         with tempfile.TemporaryDirectory() as d:
@@ -486,7 +501,7 @@ class CredentialsFileWriterTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(original)
             self.assertFalse(creds_mod.configure_aws_credentials("env2auth", _good_creds(), credentials_path=path))
-            self.assertEqual(open(path, encoding="utf-8").read(), original)
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), original)
 
     def test_replace_failure_leaves_original_and_no_temp_files(self):
         with tempfile.TemporaryDirectory() as d:
@@ -497,7 +512,7 @@ class CredentialsFileWriterTests(unittest.TestCase):
             with mock.patch("os.replace", side_effect=OSError("simulated replace failure")):
                 self.assertFalse(
                     creds_mod.configure_aws_credentials("env2auth", _good_creds(), credentials_path=path))
-            self.assertEqual(open(path, encoding="utf-8").read(), original)  # untouched
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), original)  # untouched
             leftovers = [n for n in os.listdir(d)
                          if n.startswith(".aws_cluster_connect.") and n.endswith(".tmp")]
             self.assertEqual(leftovers, [])  # our temp file was cleaned up
@@ -803,7 +818,7 @@ class ConcurrencyAndToctouTests(unittest.TestCase):
                 fh.write(original)
             expired = _good_creds(datetime.now(timezone.utc) - timedelta(hours=1))
             self.assertFalse(creds_mod.configure_aws_credentials("env2auth", expired, credentials_path=path))
-            self.assertEqual(open(path, encoding="utf-8").read(), original)
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), original)
 
     def test_symlinked_credentials_target_fails_closed_without_touching_target(self):
         with tempfile.TemporaryDirectory() as d:
@@ -814,7 +829,7 @@ class ConcurrencyAndToctouTests(unittest.TestCase):
             link = os.path.join(d, "credentials")
             os.symlink(real, link)
             self.assertFalse(creds_mod.configure_aws_credentials("env2auth", _good_creds(), credentials_path=link))
-            self.assertEqual(open(real, encoding="utf-8").read(), original)  # target untouched
+            self.assertEqual(Path(real).read_text(encoding="utf-8"), original)  # target untouched
             self.assertTrue(os.path.islink(link))                            # link not replaced
 
     def test_symlinked_lock_file_fails_closed(self):
@@ -828,7 +843,7 @@ class ConcurrencyAndToctouTests(unittest.TestCase):
                 fh.write("x")
             os.symlink(target, os.path.join(d, ".aws_cluster_connect.lock"))
             self.assertFalse(creds_mod.configure_aws_credentials("env2auth", _good_creds(), credentials_path=path))
-            self.assertEqual(open(path, encoding="utf-8").read(), original)  # unchanged
+            self.assertEqual(Path(path).read_text(encoding="utf-8"), original)  # unchanged
 
     def test_non_regular_credentials_target_fails_closed(self):
         with tempfile.TemporaryDirectory() as d:
@@ -845,6 +860,195 @@ class ConcurrencyAndToctouTests(unittest.TestCase):
             os.symlink(real, link)
             self.assertIsNone(creds_mod._read_regular_file_text(link))
             self.assertFalse(creds_mod.credentials_are_valid("env2auth", credentials_path=link))
+
+
+class ConnectKubeconfigTargetTests(unittest.TestCase):
+    """Fake-only: subprocess.run is stubbed and records argv/kwargs; 'aws' is never run and
+    no real kubeconfig is read or written."""
+
+    def _run_connect(self, kubeconfig, *, returncode=0, timeout=False):
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if timeout:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+            return mock.Mock(returncode=returncode, stdout=b"", stderr=b"")
+
+        with mock.patch.object(kube_mod.subprocess, "run", side_effect=fake_run):
+            ok = kube_mod.connect_to_cluster(
+                "fake-cluster", "eu-west-1", "env2auth", kubeconfig=kubeconfig)
+        return ok, calls
+
+    def test_no_target_is_legacy_no_kubeconfig_flag(self):
+        ok, calls = self._run_connect(None)
+        self.assertTrue(ok)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], [
+            "aws", "eks", "update-kubeconfig",
+            "--name", "fake-cluster", "--region", "eu-west-1", "--profile", "env2auth"])
+        self.assertNotIn("--kubeconfig", calls[0][0])
+
+    def test_env_unset_is_legacy(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(kube_mod.subprocess, "run", side_effect=fake_run):
+            saved = os.environ.pop("KUBECONFIG", None)
+            try:
+                ok = kube_mod.connect_to_cluster("c", "eu-west-1", "p")
+            finally:
+                if saved is not None:
+                    os.environ["KUBECONFIG"] = saved
+        self.assertTrue(ok)
+        self.assertNotIn("--kubeconfig", calls[0])
+
+    def test_reads_kubeconfig_from_environment(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            calls = []
+
+            def fake_run(argv, **kw):
+                calls.append(argv)
+                return mock.Mock(returncode=0)
+
+            with mock.patch.dict(os.environ, {"KUBECONFIG": target}, clear=False), \
+                    mock.patch.object(kube_mod.subprocess, "run", side_effect=fake_run):
+                ok = kube_mod.connect_to_cluster("c", "eu-west-1", "p")
+            self.assertTrue(ok)
+            self.assertIn("--kubeconfig", calls[0])
+            self.assertEqual(calls[0][calls[0].index("--kubeconfig") + 1], target)
+
+    def test_valid_isolated_target_pins_kubeconfig(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            ok, calls = self._run_connect(target)
+            self.assertTrue(ok)
+            argv = calls[0][0]
+            self.assertEqual(argv.count("--kubeconfig"), 1)
+            self.assertEqual(argv[argv.index("--kubeconfig") + 1], target)
+
+    def test_existing_regular_target_accepted(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            Path(target).write_text("apiVersion: v1\n", encoding="utf-8")
+            ok, calls = self._run_connect(target)
+            self.assertTrue(ok)
+            self.assertIn("--kubeconfig", calls[0][0])
+
+    def test_empty_kubeconfig_fails_closed_no_aws(self):
+        ok, calls = self._run_connect("")
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+
+    def test_whitespace_kubeconfig_fails_closed(self):
+        ok, calls = self._run_connect("   ")
+        self.assertFalse(ok)
+        self.assertEqual(calls, [])
+
+    def test_multi_path_kubeconfig_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            first = os.path.join(d, "a")
+            second = os.path.join(d, "b")
+            ok, calls = self._run_connect(first + os.pathsep + second)
+            self.assertFalse(ok)
+            self.assertEqual(calls, [])
+
+    def test_symlink_target_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            Path(real).write_text("x", encoding="utf-8")
+            link = os.path.join(d, "link")
+            os.symlink(real, link)
+            ok, calls = self._run_connect(link)
+            self.assertFalse(ok)
+            self.assertEqual(calls, [])
+
+    def test_non_regular_target_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "a-directory")
+            os.mkdir(target)
+            ok, calls = self._run_connect(target)
+            self.assertFalse(ok)
+            self.assertEqual(calls, [])
+
+    def test_missing_parent_directory_fails_closed(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "nope", "session.kubeconfig")
+            ok, calls = self._run_connect(target)
+            self.assertFalse(ok)
+            self.assertEqual(calls, [])
+
+    def test_timeout_returns_false_with_bounded_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            ok, calls = self._run_connect(target, timeout=True)
+            self.assertFalse(ok)
+            self.assertIn("timeout", calls[0][1])
+            self.assertGreater(calls[0][1]["timeout"], 0)
+
+    def test_subprocess_is_shell_free_and_redacts_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            ok, calls = self._run_connect(target)
+            argv, kwargs = calls[0]
+            self.assertIsInstance(argv, list)
+            self.assertNotIn("shell", kwargs)
+            self.assertTrue(kwargs.get("capture_output"))
+
+    def test_nonzero_exit_returns_false(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            ok, calls = self._run_connect(target, returncode=254)
+            self.assertFalse(ok)
+
+    def test_invalid_target_never_touches_global_kubeconfig(self):
+        for bad in ("", "   "):
+            ok, calls = self._run_connect(bad)
+            self.assertFalse(ok)
+            self.assertEqual(calls, [])
+
+    def test_no_argv_references_global_for_isolated_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "session.kubeconfig")
+            ok, calls = self._run_connect(target)
+            argv = calls[0][0]
+            self.assertEqual(argv[argv.index("--kubeconfig") + 1], target)
+            self.assertNotIn(os.path.join(".kube", "config"), " ".join(argv))
+
+
+class BotocoreBoundedConfigTests(unittest.TestCase):
+    def _captured_sts_config(self, cfg):
+        b = mock.MagicMock()
+        frozen = mock.Mock(access_key="ak", secret_key="sk", token="tok")
+        (b.Session.return_value.get_credentials.return_value
+         .get_frozen_credentials.return_value) = frozen
+        good = {"AccessKeyId": "a", "SecretAccessKey": "b", "SessionToken": "c",
+                "Expiration": datetime.now(timezone.utc) + timedelta(hours=1)}
+        b.client.return_value.assume_role.return_value = {"Credentials": good}
+        b.client.return_value.get_session_token.return_value = {"Credentials": good}
+        with mock.patch.object(creds_mod, "boto3", b):
+            out = creds_mod.get_temporary_credentials(cfg, "env", FAKE_MFA_SERIAL, MFA_CODE)
+        self.assertTrue(out)
+        _, kwargs = b.client.call_args
+        return kwargs.get("config")
+
+    def _assert_bounded(self, config):
+        self.assertIsNotNone(config, "STS client must use a bounded botocore Config")
+        self.assertIn("connect_timeout", config.kwargs)
+        self.assertIn("read_timeout", config.kwargs)
+        self.assertGreater(config.kwargs["connect_timeout"], 0)
+        self.assertGreater(config.kwargs["read_timeout"], 0)
+        self.assertEqual(config.kwargs.get("retries"), {"total_max_attempts": 1})
+
+    def test_role_path_sts_client_is_bounded(self):
+        self._assert_bounded(self._captured_sts_config(_role_config()))
+
+    def test_user_path_sts_client_is_bounded(self):
+        self._assert_bounded(self._captured_sts_config(_user_config()))
 
 
 if __name__ == "__main__":

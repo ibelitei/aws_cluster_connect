@@ -16,7 +16,6 @@ Exit contract:
 """
 
 import sys
-import os
 import logging
 import configparser
 import argparse
@@ -24,6 +23,8 @@ import argparse
 from aws_config import (
     read_aws_config,
     is_role_profile,
+    config_file_path,
+    credentials_file_path,
 )
 from credentials import (
     credentials_are_valid,
@@ -66,9 +67,21 @@ def main() -> int:
 
     logging.debug(f"[main] Starting script for environment: {environment}, force_refresh={force_refresh}")
 
-    # Load ~/.aws/config once, pass around as needed
+    # Resolve AWS file locations up front, honouring AWS_CONFIG_FILE and
+    # AWS_SHARED_CREDENTIALS_FILE (as the AWS CLI/SDK do). An override that is
+    # set but unusable fails closed HERE rather than silently using the default
+    # ~/.aws paths or burning an MFA/STS call before the write fails.
+    cfg_path = config_file_path()
+    creds_path = credentials_file_path()
+    if cfg_path is None or creds_path is None:
+        logging.error(
+            "[main] AWS_CONFIG_FILE or AWS_SHARED_CREDENTIALS_FILE is set but unusable; aborting."
+        )
+        return EXIT_FAILURE
+
+    # Load the AWS config once, pass around as needed
     config = configparser.ConfigParser()
-    config.read(os.path.expanduser('~/.aws/config'))
+    config.read(cfg_path)
 
     # Derive the base environment name / profile
     env_name = environment.split('-')[0].lower()

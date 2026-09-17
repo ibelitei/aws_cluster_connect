@@ -73,6 +73,29 @@ script_name/
 - **Assume Role or Get Session Token:** If credentials are expired (or you use --force-refresh), the script retrieves a TOTP code from 1Password (e.g., AmazonMYENV) and calls STS to generate temporary credentials
 - **Update Kubeconfig:** Finally, it updates ~/.kube/config so that kubectl commands work against the EKS cluster specified in the profile’s cluster_name
 
+## Isolated Kubeconfig Target & Bounded Waits
+
+- **Kubeconfig target (backward compatible):**
+  - With no isolated target (the `KUBECONFIG` environment variable is unset), the script keeps its
+    legacy standalone behaviour: `aws eks update-kubeconfig` writes to its own default
+    (`~/.kube/config`).
+  - When exactly one isolated session file is supplied via `KUBECONFIG` (the same variable the
+    DevOps Shell integration already sets — no competing mechanism), the write is pinned with
+    `aws eks update-kubeconfig --kubeconfig <target>`, so only that file is touched and the global
+    `~/.kube/config` is never modified.
+  - A `KUBECONFIG` that is set but **unusable** — empty, multiple `:`-separated entries, a symlink,
+    a non-regular existing file, or a missing parent directory — **fails closed before AWS is
+    invoked**. The script never silently falls back to the global kubeconfig after an invalid
+    isolated target.
+  - The `aws` invocation is shell-free (fixed argument vector); its output is captured and never
+    surfaced, so paths, endpoints, and account data are not leaked.
+- **Bounded waits (no hidden retries):** every external wait is time-boxed so a hung endpoint fails
+  fast and closed. STS calls use bounded botocore connect/read timeouts with retries disabled, and
+  `aws eks update-kubeconfig` runs under a subprocess timeout. Timeout failures are concise and
+  redacted. These are ceilings only — the script adds no retries, polling, background work, or
+  credential caching (see `settings.py`: `AWS_CONNECT_TIMEOUT_SECONDS`, `AWS_READ_TIMEOUT_SECONDS`,
+  `UPDATE_KUBECONFIG_TIMEOUT_SECONDS`).
+
 ## Usage
 
 - **From the script_name/ directory:**

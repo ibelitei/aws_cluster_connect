@@ -10,7 +10,14 @@ from typing import Dict, Optional
 import boto3
 
 from botocore.exceptions import ProfileNotFound, BotoCoreError
-from settings import ROLE_MAX_DURATION, USER_MAX_DURATION
+from botocore.config import Config
+from settings import (
+    ROLE_MAX_DURATION,
+    USER_MAX_DURATION,
+    AWS_CONNECT_TIMEOUT_SECONDS,
+    AWS_READ_TIMEOUT_SECONDS,
+)
+from aws_config import credentials_file_path
 
 try:
     import fcntl  # POSIX advisory locking (macOS/Linux)
@@ -27,6 +34,23 @@ EXPIRATION_METADATA_KEY = "aws_cluster_connect_expiration"
 # seconds, so an in-flight operation never races the real expiration.
 REUSE_SAFETY_MARGIN_SECONDS = 60
 
+# Absolute ceiling for a requested STS AssumeRole session, independent of
+# settings/arguments. AWS rejects DurationSeconds greater than a role's
+# MaxSessionDuration (default 3600s); requesting more makes AssumeRole fail and
+# leaves credentials unrefreshed. This hard cap guarantees the role-session
+# request never exceeds one hour even if a caller argument or ROLE_MAX_DURATION
+# is mis-set.
+_MAX_ROLE_SESSION_SECONDS = 3600
+
+# Bounded botocore client config for STS calls: hard connect/read timeouts so a hung STS
+# endpoint fails fast, and retries DISABLED (total_max_attempts=1) so this connector never
+# multiplies attempts or masks a failure with hidden retries (DSF owns its own retry policy).
+_STS_CLIENT_CONFIG = Config(
+    connect_timeout=AWS_CONNECT_TIMEOUT_SECONDS,
+    read_timeout=AWS_READ_TIMEOUT_SECONDS,
+    retries={"total_max_attempts": 1},
+)
+
 # Fixed lock-file name kept in the SAME directory as the credentials file.
 _LOCK_FILENAME = ".aws_cluster_connect.lock"
 
@@ -39,9 +63,14 @@ _REQUIRED_SECRET_KEYS = ("AccessKeyId", "SecretAccessKey", "SessionToken")
 _PROFILE_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 
 
-def _default_credentials_path() -> str:
-    """Standard shared credentials path, resolved only at call time."""
-    return os.path.expanduser(os.path.join("~", ".aws", "credentials"))
+def _default_credentials_path() -> Optional[str]:
+    """Shared credentials path, honouring AWS_SHARED_CREDENTIALS_FILE.
+
+    Resolved only at call time. Returns None when the environment override is
+    set but unusable, so callers fail closed instead of silently reading or
+    writing the default ~/.aws/credentials file.
+    """
+    return credentials_file_path()
 
 
 def _is_aware(value) -> bool:
@@ -214,7 +243,12 @@ def credentials_are_valid(profile: str, credentials_path: Optional[str] = None) 
     malformed, naive, expired, or near-expiry value. Never writes or repairs
     any state during the check.
     """
-    path = credentials_path or _default_credentials_path()
+    path = credentials_path if credentials_path is not None else _default_credentials_path()
+    if path is None:
+        logging.error(
+            "[credentials_are_valid] Unusable AWS_SHARED_CREDENTIALS_FILE; refusing reuse."
+        )
+        return False
     expiration = _read_persisted_expiration(profile, path)
     if expiration is None:
         logging.debug("[credentials_are_valid] No usable persisted expiration for '%s'.", profile)
@@ -266,8 +300,10 @@ def get_temporary_credentials(
             )
             return {}
 
-        # Limit role duration
-        role_duration = min(duration, ROLE_MAX_DURATION)
+        # Limit the role session to the safe one-hour ceiling: never exceed a
+        # role's default MaxSessionDuration (which would make AssumeRole fail and
+        # leave credentials unrefreshed).
+        role_duration = min(duration, ROLE_MAX_DURATION, _MAX_ROLE_SESSION_SECONDS)
 
         try:
             source_session = boto3.Session(profile_name=source_profile)
@@ -277,7 +313,8 @@ def get_temporary_credentials(
                 'sts',
                 aws_access_key_id=source_creds.access_key,
                 aws_secret_access_key=source_creds.secret_key,
-                aws_session_token=source_creds.token
+                aws_session_token=source_creds.token,
+                config=_STS_CLIENT_CONFIG
             )
             response = sts_client.assume_role(
                 RoleArn=role_arn,
@@ -313,7 +350,8 @@ def get_temporary_credentials(
             sts_client = boto3.client(
                 'sts',
                 aws_access_key_id=base_creds.access_key,
-                aws_secret_access_key=base_creds.secret_key
+                aws_secret_access_key=base_creds.secret_key,
+                config=_STS_CLIENT_CONFIG
             )
             response = sts_client.get_session_token(
                 DurationSeconds=duration,
@@ -384,7 +422,12 @@ def configure_aws_credentials(
         return False
     expiration_iso = expiration.astimezone(timezone.utc).isoformat()
 
-    path = credentials_path or _default_credentials_path()
+    path = credentials_path if credentials_path is not None else _default_credentials_path()
+    if path is None:
+        logging.error(
+            "[configure_aws_credentials] Unusable AWS_SHARED_CREDENTIALS_FILE; refusing to write."
+        )
+        return False
     directory = os.path.dirname(path) or "."
 
     # Parent directory must already exist (never create home paths implicitly).
