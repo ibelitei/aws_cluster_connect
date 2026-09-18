@@ -29,13 +29,8 @@ script_name/
 ├── aws_config.py         # Reads/writes AWS config data (cluster_name, region, etc.)
 ├── credentials.py        # Handles STS calls for temporary credentials
 ├── mfa.py                # Fetches TOTP codes from 1Password
-├── kube.py               # Connects to EKS via 'update-kubeconfig' (checks exit status)
-├── errors.py             # Typed operational errors + fixed process exit codes
-├── main.py               # Main entry point (CLI; fail-closed exits, no tracebacks)
-├── test_cluster_connect.py   # Fake-only tests (op/STS/aws CLI faked)
-├── requirements.txt          # Runtime deps (boto3)
-├── requirements-dev.txt      # Test/lint deps (pytest, pyflakes)
-└── .github/workflows/ci.yml  # CI: pyflakes + pytest
+├── kube.py               # Connects to EKS via 'update-kubeconfig'
+└── main.py               # Main entry point (CLI)
 ```
 
 ---
@@ -64,19 +59,42 @@ script_name/
   [env]
   aws_access_key_id = AAAABBBBCCCCDDDDEEEE
   aws_secret_access_key = aVerySecretAccessKey
-  
+
   [shared]
   aws_access_key_id = FFFFEEEEDDDDCCCCBBBB
   aws_secret_access_key = anotherSecretAccessKey
   ```
-> **_NOTE:_**  The script will create or update [<profile>2auth] in the config/credentials to store temporary tokens.
+> **_NOTE:_**  The script stores the temporary credentials in the `<profile>2auth` profile of the shared AWS credentials file using a safe atomic local update. Secret values are never passed to `aws configure set` (or any command) as arguments.
 
 ## How It Works
 
 - **Script Execution:** You run python main.py myenv, and the script derives the profile name (e.g., myenv2auth) to store temporary credentials
-- **Check Validity (fail-closed):** cached credentials for `<profile>2auth` are reused ONLY when EVERY check passes — the three temporary credential fields are present in `~/.aws/credentials`, a non-secret **target fingerprint** stored in `~/.aws/config` matches the current identity target (profile, `role_arn`, `source_profile`, `mfa_serial`, region, `cluster_name`), the stored **credential expiration** is present and still in the future, `profile_timestamp` is present and numeric, and the duration bound holds. Any missing/malformed/mismatched value forces a refresh. A missing timestamp is treated as INVALID, never as newly valid.
+- **Check Validity:** The script reuses existing credentials only when the target profile's real STS expiration (persisted in the shared credentials file) is still valid, applying a short safety margin before the actual expiry
 - **Assume Role or Get Session Token:** If credentials are expired (or you use --force-refresh), the script retrieves a TOTP code from 1Password (e.g., AmazonMYENV) and calls STS to generate temporary credentials
 - **Update Kubeconfig:** Finally, it updates ~/.kube/config so that kubectl commands work against the EKS cluster specified in the profile’s cluster_name
+
+## Isolated Kubeconfig Target & Bounded Waits
+
+- **Kubeconfig target (backward compatible):**
+  - With no isolated target (the `KUBECONFIG` environment variable is unset), the script keeps its
+    legacy standalone behaviour: `aws eks update-kubeconfig` writes to its own default
+    (`~/.kube/config`).
+  - When exactly one isolated session file is supplied via `KUBECONFIG` (the same variable the
+    DevOps Shell integration already sets — no competing mechanism), the write is pinned with
+    `aws eks update-kubeconfig --kubeconfig <target>`, so only that file is touched and the global
+    `~/.kube/config` is never modified.
+  - A `KUBECONFIG` that is set but **unusable** — empty, multiple `:`-separated entries, a symlink,
+    a non-regular existing file, or a missing parent directory — **fails closed before AWS is
+    invoked**. The script never silently falls back to the global kubeconfig after an invalid
+    isolated target.
+  - The `aws` invocation is shell-free (fixed argument vector); its output is captured and never
+    surfaced, so paths, endpoints, and account data are not leaked.
+- **Bounded waits (no hidden retries):** every external wait is time-boxed so a hung endpoint fails
+  fast and closed. STS calls use bounded botocore connect/read timeouts with retries disabled, and
+  `aws eks update-kubeconfig` runs under a subprocess timeout. Timeout failures are concise and
+  redacted. These are ceilings only — the script adds no retries, polling, background work, or
+  credential caching (see `settings.py`: `AWS_CONNECT_TIMEOUT_SECONDS`, `AWS_READ_TIMEOUT_SECONDS`,
+  `UPDATE_KUBECONFIG_TIMEOUT_SECONDS`).
 
 ## Usage
 
@@ -88,14 +106,14 @@ script_name/
   ```bash
   python main.py env-dev
   ```
-  
+
 > **_NOTE:_** The script will parse env-dev, derive env as the base profile, check credentials for [env2auth], and if needed, get a TOTP code from 1Password (Amazon<ENV_NAME>)
 
 
 ## Force Refresh
 
 - **Use the --force-refresh flag to ignore existing credentials:**
-  ```bash 
+  ```bash
   python main.py --force-refresh <env_name>-dev
   ```
 > **_NOTE:_** Even if your tokens haven’t expired, the script will retrieve new ones
@@ -124,120 +142,3 @@ script_name/
 - Confirm that the 1Password CLI is installed and authenticated (`op signin`).
 - Verify that the item name is correct (`op item get Amazon<ENV_NAME> --otp`).
 - Use `op item list` to see the available items.
-- If you configured `mfa_item`, confirm it names an existing item; otherwise the derived
-  `Amazon<SOURCE_PROFILE_UPPER>` (e.g. `AmazonSHARED`) must exist.
-
----
-
-### Old cluster/credentials kept being reused after a role change
-- This is now prevented by the fingerprint check. If you still see stale behavior, remove
-  `credential_fingerprint`/`credential_expiration`/`profile_timestamp` under
-  `[profile <env>2auth]` in `~/.aws/config` (and the `[<env>2auth]` block in
-  `~/.aws/credentials`) and re-run, or use `--force-refresh`.
-
----
-
-### Configuration error before any AWS call
-- The script validates `role_arn` (`:role/`) and `mfa_serial` (`:mfa/`) and rejects swapped,
-  equal, malformed, or missing values, and a missing `source_profile` for role profiles.
-  Fix the offending field in `~/.aws/config` and re-run.
-
----
-
-### `update-kubeconfig` failed
-- The script now exits non-zero (code 6) instead of reporting success. Check the AWS CLI
-  output shown above the error, verify the profile has valid temporary credentials and the
-  cluster/region are correct, then re-run (optionally with `--force-refresh`).
-
-## Credential cache model (fail-closed)
-
-Cache validity no longer trusts `profile_timestamp` alone. On every run the script
-computes a non-secret **target fingerprint** — a SHA-256 over the version tag plus the
-`<profile>2auth` name, `role_arn`, `source_profile`, `mfa_serial`, `region`, and
-`cluster_name`. When new STS credentials are created, the script persists (via
-`aws configure set`, into `[profile <profile>2auth]` in `~/.aws/config`):
-
-- `credential_fingerprint` — the fingerprint above (non-secret);
-- `credential_expiration` — the STS credential expiry (ISO-8601);
-- `profile_timestamp` — the write time.
-
-A later run reuses the cache only if the recomputed fingerprint matches, the expiration
-is in the future, the timestamp is present and numeric, and all three temporary
-credential fields exist in `~/.aws/credentials`. This closes the bug where old
-`legendsprod` credentials were reused after the profile was pointed at a different role
-(`legendbetprod`): the `role_arn` change alters the fingerprint, so the stale cache is
-rejected and refreshed. None of the persisted metadata is secret.
-
-## Explicit 1Password MFA item (`mfa_item`)
-
-The role-based path derives the 1Password item as `Amazon<SOURCE_PROFILE_UPPER>` (for the
-current setup this is `AmazonSHARED`, not `AmazonLEGENDBETPROD`). That derivation is kept
-for backward compatibility, but you can pin the item explicitly in `~/.aws/config`:
-
-```ini
-[profile legendbetprod]
-role_arn      = arn:aws:iam::…:role/legendbetprod
-source_profile = shared
-mfa_serial    = arn:aws:iam::…:mfa/you
-region        = eu-west-1
-cluster_name  = legendbet-prod
-mfa_item      = AmazonSHARED
-```
-
-When `mfa_item` is present it is validated (a conservative identifier charset) and used
-instead of the derivation. `op` is always invoked through a fixed argument vector
-(`op item get <item> --otp`), never a shell.
-
-## Configuration validation (before any AWS request)
-
-Before contacting STS the script validates identity configuration and returns a concise
-error (no AWS call, no traceback) when:
-
-- `role_arn` is missing or does not contain `:role/`;
-- `mfa_serial` is missing or does not contain `:mfa/`;
-- the two are swapped (`:mfa/` in `role_arn`, or `:role/` in `mfa_serial`), equal, or
-  otherwise malformed;
-- `source_profile` is missing for a role-based profile.
-
-## Exit codes (fail-closed, no tracebacks)
-
-Every failure returns a non-zero process exit status with a concise, secret-free log line
-(no keys, tokens, OTPs, credential contents, or raw provider stderr):
-
-| Code | Meaning |
-|---|---|
-| 0 | success |
-| 2 | invalid/missing/malformed configuration |
-| 3 | missing/empty MFA (OTP) token |
-| 4 | STS `ClientError` (e.g. AccessDenied, invalid MFA) |
-| 5 | failed to write temporary credentials |
-| 6 | `aws eks update-kubeconfig` returned non-zero |
-| 1 | other/unexpected failure |
-
-`kube.py` explicitly checks the `aws eks update-kubeconfig` return status; a failed
-update is never reported as success.
-
-## Rollback and safe recovery
-
-- To force a clean refresh regardless of the cache: `python main.py --force-refresh <env>`.
-- If a target changed (role/account/cluster) and you want to discard the stale cache, remove
-  the persisted metadata for the derived auth profile from `~/.aws/config`
-  (`credential_fingerprint`, `credential_expiration`, `profile_timestamp` under
-  `[profile <env>2auth]`) and its `[<env>2auth]` block in `~/.aws/credentials`, then re-run;
-  the next run recreates them. A wrong or stale fingerprint/expiration simply triggers a
-  refresh — it never connects with the old credentials.
-- On any failure the script exits non-zero and leaves your shell without a false "connected"
-  signal; fix the reported condition (config, MFA, STS, or update-kubeconfig) and re-run.
-
-## Tests & CI
-
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pyflakes *.py
-python -m pytest -q
-```
-
-Tests use fake `op`, fake STS/boto3, a fake `aws configure set`, and a fake
-`aws eks update-kubeconfig` with synthetic `~/.aws` files in a temp dir — no real AWS,
-Kubernetes, 1Password, or cloud calls, and they assert no secret/token leakage to logs.
-
