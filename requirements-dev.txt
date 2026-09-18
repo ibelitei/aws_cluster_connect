@@ -1,0 +1,4 @@
+# Test and lint dependencies. Tests fake op/STS/boto3/aws CLI, so boto3 is NOT
+# required to run them (fakes are injected into sys.modules).
+pytest>=7
+pyflakes>=3
