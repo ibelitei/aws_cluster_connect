@@ -121,6 +121,23 @@ script_name/
 
 ## Troubleshooting
 
+### Reading a Temporary-Credential Failure Line
+A failure to obtain temporary credentials is reported as one line naming the stage that failed:
+```plaintext
+[get_temporary_credentials] assume_role failed for profile 'env' (stage=sts_call, ClientError code=AccessDenied operation=AssumeRole http=403).
+```
+- `stage=source_credentials`: the source/base profile's credentials could not be resolved. The script did not create its own STS client, and its explicit AssumeRole/GetSessionToken call was not reached.
+- `stage=sts_client`: the script's STS client could not be constructed. Its explicit AssumeRole/GetSessionToken call was not reached.
+- `stage=sts_call`: the script's single explicit AssumeRole/GetSessionToken call failed. SDK retries are disabled for that client.
+
+These guarantees cover only the script's own STS client and call. Resolving the source credentials is done by the AWS SDK's credential providers. Depending on how the source profile is configured, they can make their own network calls (for example, an assume-role, SSO or credential-process source), refresh credentials, or write their own caches, even when the line says `stage=source_credentials`.
+
+For AWS service errors, `code` and `operation` are printed only when they are on a fixed allowlist of documented values. Any other value appears as `unrecognized`, and a missing or malformed value as `unavailable`. `http` appears only for a valid status code. Every other failure shows only the exception class name. The script never prints the exception message, raw response, request ID, request parameters (role ARN, MFA serial or code), or credential values.
+
+When obtaining temporary credentials fails at any of these stages, the script exits 1 before it writes credentials to the shared credentials file and before it updates the kubeconfig. That covers only this step. If a later step fails, earlier steps may already have taken effect: for example, if `aws eks update-kubeconfig` fails after a successful refresh, the new temporary credentials have already been stored. The script does not retry or refresh automatically.
+
+---
+
 ### Invalid MFA One-Time Passcode
 - Ensure the 1Password item name matches exactly what the script expects (e.g., `Amazon<ENV_NAME>`).
 - Confirm `mfa_serial` in `~/.aws/config` belongs to the same user who owns the TOTP device.

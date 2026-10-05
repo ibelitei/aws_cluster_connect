@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Optional
 import boto3
 
+from botocore import exceptions as _botocore_exceptions
 from botocore.exceptions import ProfileNotFound, BotoCoreError
 from botocore.config import Config
 from settings import (
@@ -61,6 +62,45 @@ _REQUIRED_SECRET_KEYS = ("AccessKeyId", "SecretAccessKey", "SessionToken")
 # section-injection characters ('[' / ']' / newlines) by construction, while
 # accepting the derived '<env>2auth' names.
 _PROFILE_NAME_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+# --- Secret-free failure diagnostics for temporary-credential retrieval ------
+# Stages of get_temporary_credentials, reported on every failure line:
+#   source_credentials -> resolving the source/base profile's credentials (no STS client yet);
+#   sts_client         -> constructing the bounded STS client (no request sent);
+#   sts_call           -> the single AssumeRole / GetSessionToken request.
+STAGE_SOURCE_CREDENTIALS = "source_credentials"
+STAGE_STS_CLIENT = "sts_client"
+STAGE_STS_CALL = "sts_call"
+
+# Public, documented AWS/STS error codes that may be reported VERBATIM. Any other value the
+# service returns is reported as "unrecognized", so an arbitrary server-supplied string never
+# reaches the log. None of these codes carries a credential, MFA value, account, ARN or request id.
+_REPORTABLE_AWS_ERROR_CODES = frozenset({
+    "AccessDenied",
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "IncompleteSignature",
+    "InternalFailure",
+    "InvalidClientTokenId",
+    "InvalidParameterValue",
+    "MalformedPolicyDocument",
+    "MissingAuthenticationToken",
+    "OptInRequired",
+    "PackedPolicyTooLarge",
+    "RegionDisabledException",
+    "RequestExpired",
+    "ServiceUnavailable",
+    "SignatureDoesNotMatch",
+    "Throttling",
+    "ThrottlingException",
+    "ValidationError",
+})
+
+# STS operations this module calls; any other operation name is reported as "unrecognized".
+_REPORTABLE_STS_OPERATIONS = frozenset({"AssumeRole", "GetSessionToken"})
+
+# Exception class names are reported only when they look like a plain Python identifier.
+_SAFE_CLASS_NAME_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]{0,63}\Z")
 
 
 def _default_credentials_path() -> Optional[str]:
@@ -184,6 +224,70 @@ def _valid_profile_name(profile) -> bool:
     return isinstance(profile, str) and bool(_PROFILE_NAME_RE.match(profile))
 
 
+def _safe_class_name(exc, default: str = "Exception") -> str:
+    """The exception's class name if it is a plain identifier, else `default`."""
+    name = getattr(type(exc), "__name__", None)
+    if type(name) is str and _SAFE_CLASS_NAME_RE.match(name):
+        return name
+    return default
+
+
+def _reportable_token(value, allowlist) -> str:
+    """`value` if it is an exact, allowlisted str; "unrecognized" for any other non-empty
+    str; "unavailable" for anything missing, empty or of another type."""
+    if type(value) is not str or not value:
+        return "unavailable"
+    return value if value in allowlist else "unrecognized"
+
+
+def _reportable_http_status(response) -> Optional[int]:
+    """ResponseMetadata.HTTPStatusCode if it is a real int (bool rejected) in 100-599."""
+    metadata = response.get("ResponseMetadata") if isinstance(response, dict) else None
+    status = metadata.get("HTTPStatusCode") if isinstance(metadata, dict) else None
+    if type(status) is int and 100 <= status <= 599:
+        return status
+    return None
+
+
+def describe_aws_failure(exc) -> str:
+    """
+    Secret-free, fixed-vocabulary description of an SDK/STS failure.
+
+    For a botocore ClientError (including modeled subclasses) it returns
+    "<Class> code=<code> operation=<operation>[ http=<status>]", where code and operation
+    are reported verbatim only when allowlisted (otherwise "unrecognized"/"unavailable")
+    and the HTTP status only when it is a valid integer. Every other exception, and any
+    response that cannot be read safely, falls back to the exception class name. The
+    exception message, the raw response (error message, request id, metadata), request
+    parameters, credentials and MFA values are never included.
+    """
+    client_error = getattr(_botocore_exceptions, "ClientError", None)
+    if not (isinstance(client_error, type) and isinstance(exc, client_error)):
+        return _safe_class_name(exc)
+    name = _safe_class_name(exc, default="ClientError")
+    try:
+        response = getattr(exc, "response", None)
+        error = response.get("Error") if isinstance(response, dict) else None
+        code = _reportable_token(error.get("Code") if isinstance(error, dict) else None,
+                                 _REPORTABLE_AWS_ERROR_CODES)
+        operation = _reportable_token(getattr(exc, "operation_name", None),
+                                      _REPORTABLE_STS_OPERATIONS)
+        status = _reportable_http_status(response)
+    except Exception:
+        return name
+    detail = f"{name} code={code} operation={operation}"
+    if status is not None:
+        detail += f" http={status}"
+    return detail
+
+
+def _log_temporary_credentials_failure(api: str, profile: str, stage: str, detail: str) -> None:
+    logging.error(
+        "[get_temporary_credentials] %s failed for profile '%s' (stage=%s, %s).",
+        api, profile, stage, detail,
+    )
+
+
 def get_aws_session(profile: str):
     """
     Attempts to create a boto3 Session for a given AWS CLI profile.
@@ -275,6 +379,11 @@ def get_temporary_credentials(
     Credentials are NOT cached in-process: each call re-derives from STS, so a
     stale value can never be reused beyond its real expiration. Error logs never
     include the MFA token, the returned secrets, or the raw STS response/exception.
+
+    Each failure line names its stage (source_credentials, sts_client, sts_call; see
+    describe_aws_failure for the detail format). A failed stage stops the flow: no STS
+    client is constructed after a source_credentials failure, no request is sent after an
+    sts_client failure, and exactly one request (SDK retries disabled) is made at sts_call.
     """
     profile_key = f'profile {profile}' if not profile.startswith('profile ') else profile
     is_role_based = config.has_section(profile_key) and config.has_option(profile_key, 'role_arn')
@@ -305,10 +414,22 @@ def get_temporary_credentials(
         # leave credentials unrefreshed).
         role_duration = min(duration, ROLE_MAX_DURATION, _MAX_ROLE_SESSION_SECONDS)
 
+        # Stage source_credentials: resolve the source profile's credentials.
         try:
             source_session = boto3.Session(profile_name=source_profile)
-            source_creds = source_session.get_credentials().get_frozen_credentials()
+            resolved = source_session.get_credentials()
+            source_creds = None if resolved is None else resolved.get_frozen_credentials()
+        except Exception as exc:
+            _log_temporary_credentials_failure(
+                "assume_role", profile, STAGE_SOURCE_CREDENTIALS, describe_aws_failure(exc))
+            return {}
+        if source_creds is None:
+            _log_temporary_credentials_failure(
+                "assume_role", profile, STAGE_SOURCE_CREDENTIALS, "no credentials resolved")
+            return {}
 
+        # Stage sts_client: construct the bounded STS client (sends no request).
+        try:
             sts_client = boto3.client(
                 'sts',
                 aws_access_key_id=source_creds.access_key,
@@ -316,6 +437,13 @@ def get_temporary_credentials(
                 aws_session_token=source_creds.token,
                 config=_STS_CLIENT_CONFIG
             )
+        except Exception as exc:
+            _log_temporary_credentials_failure(
+                "assume_role", profile, STAGE_STS_CLIENT, describe_aws_failure(exc))
+            return {}
+
+        # Stage sts_call: exactly one AssumeRole request.
+        try:
             response = sts_client.assume_role(
                 RoleArn=role_arn,
                 RoleSessionName=f"{profile}-session",
@@ -324,10 +452,8 @@ def get_temporary_credentials(
                 TokenCode=mfa_token
             )
         except Exception as exc:
-            logging.error(
-                "[get_temporary_credentials] assume_role failed for profile '%s' (%s).",
-                profile, type(exc).__name__,
-            )
+            _log_temporary_credentials_failure(
+                "assume_role", profile, STAGE_STS_CALL, describe_aws_failure(exc))
             return {}
 
         new_credentials = _valid_sts_credentials(response)
@@ -340,29 +466,47 @@ def get_temporary_credentials(
         return new_credentials
     else:
         # Classic IAM user
+        # Stage source_credentials: the profile's own (base) session and credentials.
         session = get_aws_session(profile)
         if not session:
-            logging.error(f"[get_temporary_credentials] Could not create session for profile '{profile}'.")
+            _log_temporary_credentials_failure(
+                "get_session_token", profile, STAGE_SOURCE_CREDENTIALS, "session unavailable")
+            return {}
+        try:
+            resolved = session.get_credentials()
+            base_creds = None if resolved is None else resolved.get_frozen_credentials()
+        except Exception as exc:
+            _log_temporary_credentials_failure(
+                "get_session_token", profile, STAGE_SOURCE_CREDENTIALS, describe_aws_failure(exc))
+            return {}
+        if base_creds is None:
+            _log_temporary_credentials_failure(
+                "get_session_token", profile, STAGE_SOURCE_CREDENTIALS, "no credentials resolved")
             return {}
 
+        # Stage sts_client: construct the bounded STS client (sends no request).
         try:
-            base_creds = session.get_credentials().get_frozen_credentials()
             sts_client = boto3.client(
                 'sts',
                 aws_access_key_id=base_creds.access_key,
                 aws_secret_access_key=base_creds.secret_key,
                 config=_STS_CLIENT_CONFIG
             )
+        except Exception as exc:
+            _log_temporary_credentials_failure(
+                "get_session_token", profile, STAGE_STS_CLIENT, describe_aws_failure(exc))
+            return {}
+
+        # Stage sts_call: exactly one GetSessionToken request.
+        try:
             response = sts_client.get_session_token(
                 DurationSeconds=duration,
                 SerialNumber=mfa_serial,
                 TokenCode=mfa_token
             )
         except Exception as exc:
-            logging.error(
-                "[get_temporary_credentials] get_session_token failed for profile '%s' (%s).",
-                profile, type(exc).__name__,
-            )
+            _log_temporary_credentials_failure(
+                "get_session_token", profile, STAGE_STS_CALL, describe_aws_failure(exc))
             return {}
 
         new_credentials = _valid_sts_credentials(response)
