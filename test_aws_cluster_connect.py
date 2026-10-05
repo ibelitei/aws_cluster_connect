@@ -12,6 +12,9 @@ file.
 Run with:  python3 -m unittest test_aws_cluster_connect -v
 """
 import configparser
+import contextlib
+import hashlib
+import io
 import logging
 import os
 import stat
@@ -43,8 +46,23 @@ class _ProfileNotFound(_BotoCoreError):
     pass
 
 
+class _ClientError(Exception):
+    """Stand-in for botocore.exceptions.ClientError(error_response, operation_name).
+
+    Like botocore, the message embeds the service-supplied payload, so tests can prove
+    the connector never logs str(exc) or the raw response.
+    """
+
+    def __init__(self, error_response, operation_name):
+        self.response = error_response
+        self.operation_name = operation_name
+        super().__init__(f"An error occurred calling {operation_name!r}: {error_response!r}")
+
+
+_ClientError.__name__ = _ClientError.__qualname__ = "ClientError"  # the real botocore class name
 _botocore_exc.BotoCoreError = _BotoCoreError
 _botocore_exc.ProfileNotFound = _ProfileNotFound
+_botocore_exc.ClientError = _ClientError
 _botocore.exceptions = _botocore_exc
 sys.modules.setdefault("botocore", _botocore)
 sys.modules.setdefault("botocore.exceptions", _botocore_exc)
@@ -1049,6 +1067,524 @@ class BotocoreBoundedConfigTests(unittest.TestCase):
 
     def test_user_path_sts_client_is_bounded(self):
         self._assert_bounded(self._captured_sts_config(_user_config()))
+
+
+# ===========================================================================
+# STS failure diagnostics: stage, allowlisted code/operation, redaction and
+# per-stage call counts. Synthetic identifiers only; every SDK boundary is faked.
+# ===========================================================================
+# The ClientError class credentials.py actually sees (whichever test module's shim
+# was registered first in sys.modules).
+ClientError = creds_mod._botocore_exceptions.ClientError
+EndpointConnectionError = type("EndpointConnectionError", (creds_mod.BotoCoreError,), {})
+ParamValidationError = type("ParamValidationError", (creds_mod.BotoCoreError,), {})
+RegionDisabledException = type("RegionDisabledException", (ClientError,), {})
+
+DIAG_PROFILE = "exampleenv"
+DIAG_SOURCE_PROFILE = "examplesource"
+DIAG_ACCOUNT = "111111111111"
+DIAG_ROLE_ARN = f"arn:aws:iam::{DIAG_ACCOUNT}:role/example-diag-role"
+DIAG_MFA_SERIAL = f"arn:aws:iam::{DIAG_ACCOUNT}:mfa/example-diag-device"
+DIAG_MFA_CODE = "975310"
+DIAG_REQUEST_ID = "REQUEST-ID-SENTINEL-6f6f"
+DIAG_MESSAGE = "MESSAGE-SENTINEL MultiFactorAuthentication failed for example-diag-device"
+DIAG_SRC_ACCESS = "SRC-ACCESS-SENTINEL-3131"
+DIAG_SRC_SECRET = "SRC-SECRET-SENTINEL-3232"
+DIAG_SRC_TOKEN = "SRC-TOKEN-SENTINEL-3333"
+DIAG_SENTINELS = SECRET_VALUES + (
+    DIAG_ACCOUNT, DIAG_ROLE_ARN, DIAG_MFA_SERIAL, DIAG_MFA_CODE, DIAG_REQUEST_ID,
+    "MESSAGE-SENTINEL", DIAG_SRC_ACCESS, DIAG_SRC_SECRET, DIAG_SRC_TOKEN,
+)
+
+EXPECTED_REPORTABLE_CODES = frozenset({
+    "AccessDenied", "ExpiredToken", "ExpiredTokenException", "IncompleteSignature",
+    "InternalFailure", "InvalidClientTokenId", "InvalidParameterValue",
+    "MalformedPolicyDocument", "MissingAuthenticationToken", "OptInRequired",
+    "PackedPolicyTooLarge", "RegionDisabledException", "RequestExpired",
+    "ServiceUnavailable", "SignatureDoesNotMatch", "Throttling", "ThrottlingException",
+    "ValidationError",
+})
+
+
+def _sts_error_response(code="AccessDenied", status=403):
+    """A service error payload carrying sentinels in every field that must never be logged."""
+    return {
+        "Error": {"Type": "Sender", "Code": code, "Message": DIAG_MESSAGE},
+        "ResponseMetadata": {"RequestId": DIAG_REQUEST_ID, "HTTPStatusCode": status},
+        # Hostile extras a real service would not echo; they must still never be logged.
+        "Credentials": {"AccessKeyId": ACCESS_KEY, "SecretAccessKey": SECRET_KEY,
+                        "SessionToken": SESSION_TOKEN},
+        "RoleArn": DIAG_ROLE_ARN, "SerialNumber": DIAG_MFA_SERIAL, "TokenCode": DIAG_MFA_CODE,
+    }
+
+
+def _assert_no_sentinels(test, text, label=""):
+    for token in DIAG_SENTINELS:
+        test.assertNotIn(token, text, f"sentinel leaked {label}")
+
+
+class StsFailureDescriptionTests(unittest.TestCase):
+    """describe_aws_failure: fixed vocabulary, allowlists, class-name fallback."""
+
+    def _describe(self, exc):
+        out = creds_mod.describe_aws_failure(exc)
+        _assert_no_sentinels(self, out, f"for {type(exc).__name__}")
+        self.assertNotIn(str(exc), out)
+        return out
+
+    def test_allowlists_are_exactly_the_documented_sets(self):
+        self.assertEqual(creds_mod._REPORTABLE_AWS_ERROR_CODES, EXPECTED_REPORTABLE_CODES)
+        self.assertEqual(creds_mod._REPORTABLE_STS_OPERATIONS,
+                         frozenset({"AssumeRole", "GetSessionToken"}))
+
+    def test_allowlisted_codes_and_operations_are_reported(self):
+        for code in sorted(EXPECTED_REPORTABLE_CODES):
+            for op in ("AssumeRole", "GetSessionToken"):
+                with self.subTest(code=code, op=op):
+                    exc = ClientError(_sts_error_response(code, 400), op)
+                    self.assertEqual(self._describe(exc),
+                                     f"ClientError code={code} operation={op} http=400")
+
+    def test_modeled_client_error_subclass_keeps_its_class_name(self):
+        exc = RegionDisabledException(_sts_error_response("RegionDisabledException", 403),
+                                      "AssumeRole")
+        self.assertEqual(self._describe(exc),
+                         "RegionDisabledException code=RegionDisabledException "
+                         "operation=AssumeRole http=403")
+
+    def test_malformed_responses_report_code_unavailable(self):
+        malformed = (
+            None, "not-a-dict " + SECRET_KEY, [], {}, {"Error": "AccessDenied"},
+            {"Error": None}, {"Error": {}}, {"Error": {"Code": None}}, {"Error": {"Code": ""}},
+            {"Error": {"Code": 403}}, {"Error": {"Code": ["AccessDenied"]}},
+            {"Error": {"Code": b"AccessDenied"}},
+        )
+        for response in malformed:
+            with self.subTest(response=repr(response)[:40]):
+                self.assertEqual(self._describe(ClientError(response, "AssumeRole")),
+                                 "ClientError code=unavailable operation=AssumeRole")
+
+    def test_unknown_code_values_are_never_echoed(self):
+        class _SneakyStr(str):
+            pass
+        unknown = ("SomethingNew", "accessdenied", "AccessDenied ", "AccessDenied\nInjected",
+                   "<b>AccessDenied</b>", "X" * 10240, SECRET_KEY, DIAG_ROLE_ARN, DIAG_ACCOUNT)
+        for code in unknown:
+            with self.subTest(code=code[:30]):
+                out = self._describe(ClientError({"Error": {"Code": code}}, "AssumeRole"))
+                self.assertEqual(out, "ClientError code=unrecognized operation=AssumeRole")
+        # A str SUBCLASS is not trusted, even when it compares equal to an allowlisted code.
+        out = self._describe(ClientError({"Error": {"Code": _SneakyStr("AccessDenied")}},
+                                          "AssumeRole"))
+        self.assertEqual(out, "ClientError code=unavailable operation=AssumeRole")
+
+    def test_operation_name_is_allowlisted(self):
+        cases = ((None, "unavailable"), ("", "unavailable"), (42, "unavailable"),
+                 ("DescribeCluster", "unrecognized"), ("AssumeRole ", "unrecognized"),
+                 (SECRET_KEY, "unrecognized"), ("GetSessionToken", "GetSessionToken"))
+        for op, expected in cases:
+            with self.subTest(op=op):
+                out = self._describe(ClientError({"Error": {"Code": "AccessDenied"}}, op))
+                self.assertEqual(out, f"ClientError code=AccessDenied operation={expected}")
+
+    def test_http_status_must_be_a_real_int_in_range(self):
+        class _SneakyInt(int):
+            def __format__(self, spec):
+                return SECRET_KEY
+
+            __str__ = __repr__ = lambda self: SECRET_KEY
+        rejected = (True, False, "403", 403.0, 99, 600, -1, None, [403], {"code": 403},
+                    _SneakyInt(403))
+        for status in rejected:
+            with self.subTest(status=status):
+                out = self._describe(ClientError(_sts_error_response("AccessDenied", status),
+                                                 "AssumeRole"))
+                self.assertEqual(out, "ClientError code=AccessDenied operation=AssumeRole")
+        for status in (100, 403, 599):
+            with self.subTest(status=status):
+                out = self._describe(ClientError(_sts_error_response("AccessDenied", status),
+                                                 "AssumeRole"))
+                self.assertEqual(out, f"ClientError code=AccessDenied operation=AssumeRole "
+                                      f"http={status}")
+        bad_metadata = {"Error": {"Code": "Throttling"}, "ResponseMetadata": "403"}
+        self.assertEqual(self._describe(ClientError(bad_metadata, "AssumeRole")),
+                         "ClientError code=Throttling operation=AssumeRole")
+
+    def test_non_client_errors_fall_back_to_class_name(self):
+        cases = (
+            (RuntimeError(f"boom {SECRET_KEY} {DIAG_ROLE_ARN}"), "RuntimeError"),
+            (EndpointConnectionError(f"https://sts.example.invalid {DIAG_REQUEST_ID}"),
+             "EndpointConnectionError"),
+            (ParamValidationError(f"TokenCode={DIAG_MFA_CODE}"), "ParamValidationError"),
+            (creds_mod.ProfileNotFound(DIAG_SOURCE_PROFILE), creds_mod.ProfileNotFound.__name__),
+        )
+        for exc, expected in cases:
+            with self.subTest(exc=expected):
+                self.assertEqual(self._describe(exc), expected)
+
+    def test_response_attribute_on_a_non_client_error_is_ignored(self):
+        exc = RuntimeError("payload " + SESSION_TOKEN)
+        exc.response = _sts_error_response("AccessDenied", 403)
+        exc.operation_name = "AssumeRole"
+        self.assertEqual(self._describe(exc), "RuntimeError")
+
+    def test_unsafe_class_names_are_replaced(self):
+        hostile = type(f"Bad Name<{SECRET_KEY}>", (Exception,), {})
+        too_long = type("E" * 65, (Exception,), {})
+        self.assertEqual(self._describe(hostile("hostile-message")), "Exception")
+        self.assertEqual(self._describe(too_long("too-long-message")), "Exception")
+        hostile_client = type(f"Client Error {SECRET_KEY}", (ClientError,), {})
+        self.assertEqual(
+            self._describe(hostile_client(_sts_error_response("AccessDenied", 403), "AssumeRole")),
+            "ClientError code=AccessDenied operation=AssumeRole http=403")
+
+    def test_unreadable_response_falls_back_to_class_name(self):
+        class RaisingResponseError(ClientError):
+            @property
+            def response(self):
+                raise RuntimeError("response access " + SECRET_KEY)
+
+            @response.setter
+            def response(self, value):
+                pass
+
+        class RaisingDict(dict):
+            def get(self, *a, **k):
+                raise RuntimeError("dict access " + SECRET_KEY)
+
+        self.assertEqual(self._describe(RaisingResponseError({}, "AssumeRole")),
+                         "RaisingResponseError")
+        self.assertEqual(self._describe(ClientError(RaisingDict(), "AssumeRole")), "ClientError")
+
+
+def _diag_role_config(profile=DIAG_PROFILE):
+    cp = configparser.ConfigParser()
+    section = f"profile {profile}"
+    cp.add_section(section)
+    cp.set(section, "role_arn", DIAG_ROLE_ARN)
+    cp.set(section, "source_profile", DIAG_SOURCE_PROFILE)
+    return cp
+
+
+def _diag_user_config(profile=DIAG_PROFILE):
+    cp = configparser.ConfigParser()
+    cp.add_section(f"profile {profile}")
+    return cp
+
+
+def _staged_boto3(*, session_exc=None, no_credentials=False, credentials_exc=None,
+                  frozen_exc=None, client_exc=None, call_exc=None, response=None):
+    """Fake boto3 that fails at exactly one chosen point and records every SDK operation."""
+    b = mock.MagicMock()
+    if session_exc is not None:
+        b.Session.side_effect = session_exc
+    session = b.Session.return_value
+    if no_credentials:
+        session.get_credentials.return_value = None
+    elif credentials_exc is not None:
+        session.get_credentials.side_effect = credentials_exc
+    elif frozen_exc is not None:
+        session.get_credentials.return_value.get_frozen_credentials.side_effect = frozen_exc
+    else:
+        session.get_credentials.return_value.get_frozen_credentials.return_value = mock.Mock(
+            access_key=DIAG_SRC_ACCESS, secret_key=DIAG_SRC_SECRET, token=DIAG_SRC_TOKEN)
+    if client_exc is not None:
+        b.client.side_effect = client_exc
+    client = b.client.return_value
+    ok = response if response is not None else {"Credentials": _sentinel_creds(
+        AccessKeyId=ACCESS_KEY, SecretAccessKey=SECRET_KEY, SessionToken=SESSION_TOKEN)}
+    for op in ("assume_role", "get_session_token"):
+        if call_exc is not None:
+            getattr(client, op).side_effect = call_exc
+        else:
+            getattr(client, op).return_value = ok
+    return b, client
+
+
+def _failure_lines(log_text):
+    return [line for line in log_text.splitlines()
+            if line.startswith("[get_temporary_credentials]") and " failed for profile " in line]
+
+
+class StsFailureStageTests(unittest.TestCase):
+    """get_temporary_credentials: stage label, detail and actual per-stage SDK call counts."""
+
+    def _run(self, cfg, b):
+        with _CaptureLogs() as cap, mock.patch.object(creds_mod, "boto3", b):
+            out = creds_mod.get_temporary_credentials(cfg, DIAG_PROFILE, DIAG_MFA_SERIAL,
+                                                      DIAG_MFA_CODE)
+        self.assertEqual(out, {})
+        _assert_no_sentinels(self, cap.text, "in logs")
+        lines = _failure_lines(cap.text)
+        self.assertEqual(len(lines), 1, cap.text)
+        return lines[0]
+
+    def _counts(self, b, client):
+        return (b.Session.call_count, b.client.call_count,
+                client.assume_role.call_count, client.get_session_token.call_count)
+
+    # -- role path (AssumeRole) ---------------------------------------------
+    def test_role_source_profile_not_found(self):
+        b, client = _staged_boto3(session_exc=creds_mod.ProfileNotFound(DIAG_SOURCE_PROFILE))
+        line = self._run(_diag_role_config(), b)
+        self.assertEqual(line, "[get_temporary_credentials] assume_role failed for profile "
+                               f"'{DIAG_PROFILE}' (stage=source_credentials, "
+                               f"{creds_mod.ProfileNotFound.__name__}).")
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_role_source_get_credentials_none_is_handled(self):
+        b, client = _staged_boto3(no_credentials=True)
+        line = self._run(_diag_role_config(), b)
+        self.assertEqual(line, "[get_temporary_credentials] assume_role failed for profile "
+                               f"'{DIAG_PROFILE}' (stage=source_credentials, "
+                               "no credentials resolved).")
+        self.assertNotIn("AttributeError", line)
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_role_source_provider_client_error(self):
+        b, client = _staged_boto3(credentials_exc=ClientError(
+            _sts_error_response("AccessDenied", 403), "GetRoleCredentials"))
+        line = self._run(_diag_role_config(), b)
+        self.assertIn("(stage=source_credentials, ClientError code=AccessDenied "
+                      "operation=unrecognized http=403).", line)
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_role_source_frozen_credentials_error(self):
+        b, client = _staged_boto3(frozen_exc=RuntimeError("frozen " + DIAG_SRC_SECRET))
+        line = self._run(_diag_role_config(), b)
+        self.assertIn("(stage=source_credentials, RuntimeError).", line)
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_role_sts_client_construction_failure(self):
+        b, client = _staged_boto3(client_exc=creds_mod.ProfileNotFound("ambient-profile"))
+        line = self._run(_diag_role_config(), b)
+        self.assertIn(f"(stage=sts_client, {creds_mod.ProfileNotFound.__name__}).", line)
+        self.assertEqual(self._counts(b, client), (1, 1, 0, 0))
+
+    def test_role_sts_call_client_error(self):
+        b, client = _staged_boto3(call_exc=ClientError(_sts_error_response("AccessDenied", 403),
+                                                       "AssumeRole"))
+        line = self._run(_diag_role_config(), b)
+        self.assertEqual(line, "[get_temporary_credentials] assume_role failed for profile "
+                               f"'{DIAG_PROFILE}' (stage=sts_call, ClientError "
+                               "code=AccessDenied operation=AssumeRole http=403).")
+        self.assertEqual(self._counts(b, client), (1, 1, 1, 0))
+
+    def test_role_sts_call_modeled_subclass(self):
+        b, client = _staged_boto3(call_exc=RegionDisabledException(
+            _sts_error_response("RegionDisabledException", 403), "AssumeRole"))
+        line = self._run(_diag_role_config(), b)
+        self.assertIn("(stage=sts_call, RegionDisabledException code=RegionDisabledException "
+                      "operation=AssumeRole http=403).", line)
+        self.assertEqual(self._counts(b, client), (1, 1, 1, 0))
+
+    def test_role_sts_call_non_client_errors(self):
+        for exc, name in ((EndpointConnectionError("conn " + DIAG_REQUEST_ID),
+                           "EndpointConnectionError"),
+                          (ParamValidationError("TokenCode " + DIAG_MFA_CODE),
+                           "ParamValidationError"),
+                          (RuntimeError("raw " + SECRET_KEY), "RuntimeError")):
+            with self.subTest(name=name):
+                b, client = _staged_boto3(call_exc=exc)
+                line = self._run(_diag_role_config(), b)
+                self.assertIn(f"(stage=sts_call, {name}).", line)
+                self.assertEqual(self._counts(b, client), (1, 1, 1, 0))
+
+    # -- user path (GetSessionToken) ----------------------------------------
+    def test_user_session_unavailable(self):
+        b, client = _staged_boto3(session_exc=creds_mod.ProfileNotFound(DIAG_PROFILE))
+        line = self._run(_diag_user_config(), b)
+        self.assertEqual(line, "[get_temporary_credentials] get_session_token failed for "
+                               f"profile '{DIAG_PROFILE}' (stage=source_credentials, "
+                               "session unavailable).")
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_user_get_credentials_none_is_handled(self):
+        b, client = _staged_boto3(no_credentials=True)
+        line = self._run(_diag_user_config(), b)
+        self.assertIn("(stage=source_credentials, no credentials resolved).", line)
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_user_sts_client_construction_failure(self):
+        b, client = _staged_boto3(client_exc=ValueError("client " + SECRET_KEY))
+        line = self._run(_diag_user_config(), b)
+        self.assertIn("(stage=sts_client, ValueError).", line)
+        self.assertEqual(self._counts(b, client), (1, 1, 0, 0))
+
+    def test_user_sts_call_client_error(self):
+        b, client = _staged_boto3(call_exc=ClientError(
+            _sts_error_response("InvalidClientTokenId", 403), "GetSessionToken"))
+        line = self._run(_diag_user_config(), b)
+        self.assertIn("(stage=sts_call, ClientError code=InvalidClientTokenId "
+                      "operation=GetSessionToken http=403).", line)
+        self.assertEqual(self._counts(b, client), (1, 1, 0, 1))
+
+
+def _tree_digest(directory):
+    digest = {}
+    for root, _dirs, files in os.walk(directory):
+        for name in files:
+            path = os.path.join(root, name)
+            with open(path, "rb") as fh:
+                digest[os.path.relpath(path, directory)] = hashlib.sha256(fh.read()).hexdigest()
+    return digest
+
+
+class StsFailureMainFlowTests(unittest.TestCase):
+    """main() end to end with synthetic config/credentials/kubeconfig files in a temporary
+    directory. Only the SDK, the MFA lookup and the aws CLI are faked."""
+
+    KUBE_SENTINEL = "apiVersion: v1\n# KUBECONFIG-SENTINEL-8080\n"
+
+    def _drive(self, b, *, role=True, reuse=False):
+        with tempfile.TemporaryDirectory() as d:
+            cfg_path = os.path.join(d, "config")
+            creds_path = os.path.join(d, "credentials")
+            kube_path = os.path.join(d, "session.kubeconfig")
+            role_lines = ([f"role_arn = {DIAG_ROLE_ARN}", f"source_profile = {DIAG_SOURCE_PROFILE}"]
+                          if role else [])
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join([f"[profile {DIAG_PROFILE}]", "cluster_name = example-cluster",
+                                    "region = eu-west-1", f"mfa_serial = {DIAG_MFA_SERIAL}"]
+                                   + role_lines) + "\n")
+            expiration = datetime.now(timezone.utc) + (timedelta(hours=1) if reuse
+                                                       else -timedelta(hours=1))
+            with open(creds_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join([
+                    f"[{DIAG_SOURCE_PROFILE}]",
+                    f"aws_access_key_id = {DIAG_SRC_ACCESS}",
+                    f"aws_secret_access_key = {DIAG_SRC_SECRET}",
+                    f"[{DIAG_PROFILE}2auth]",
+                    f"aws_access_key_id = {CRED_SENTINEL}-ak",
+                    f"aws_secret_access_key = {CRED_SENTINEL}-sk",
+                    f"aws_session_token = {CRED_SENTINEL}-tok",
+                    f"{creds_mod.EXPIRATION_METADATA_KEY} = {expiration.isoformat()}",
+                ]) + "\n")
+            with open(kube_path, "w", encoding="utf-8") as fh:
+                fh.write(self.KUBE_SENTINEL)
+            before = _tree_digest(d)
+
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("AWS_") and k != "KUBECONFIG"}
+            env.update(AWS_CONFIG_FILE=cfg_path, AWS_SHARED_CREDENTIALS_FILE=creds_path,
+                       KUBECONFIG=kube_path)
+            mfa = mock.MagicMock(return_value=DIAG_MFA_CODE)
+            run = mock.MagicMock(return_value=mock.Mock(returncode=0))
+            out, err = io.StringIO(), io.StringIO()
+            with _CaptureLogs() as cap, contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err), \
+                    mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(main_mod, "parse_args",
+                                      return_value=Namespace(environment=DIAG_PROFILE,
+                                                             force_refresh=False)), \
+                    mock.patch.object(main_mod, "get_mfa_token", mfa), \
+                    mock.patch.object(creds_mod, "boto3", b), \
+                    mock.patch.object(kube_mod.subprocess, "run", run), \
+                    mock.patch.object(creds_mod.os, "replace", wraps=os.replace) as replace:
+                rc = main_mod.main()
+            after = _tree_digest(d)
+            with open(creds_path, encoding="utf-8") as fh:
+                creds_after = fh.read()
+        return Namespace(rc=rc, log=cap.text, out=out.getvalue(), err=err.getvalue(), mfa=mfa,
+                         run=run, replace=replace, before=before, after=after,
+                         creds_after=creds_after, kube_path=kube_path)
+
+    def _assert_failed_without_side_effects(self, r, stage_fragment):
+        self.assertEqual(r.rc, 1)
+        self.assertEqual(r.mfa.call_count, 1)            # one MFA lookup, no retry
+        self.assertEqual(r.replace.call_count, 0)        # no credential write
+        self.assertEqual(r.run.call_count, 0)            # no 'aws eks update-kubeconfig'
+        self.assertEqual(r.after, r.before)              # files byte-identical, none added
+        self.assertIn("[main] Failed to obtain temporary credentials.", r.log)
+        lines = _failure_lines(r.log)
+        self.assertEqual(len(lines), 1, r.log)
+        self.assertIn(stage_fragment, lines[0])
+        for text, label in ((r.log, "log"), (r.out, "stdout"), (r.err, "stderr")):
+            _assert_no_sentinels(self, text, f"in {label}")
+            self.assertNotIn(CRED_SENTINEL, text)
+
+    def _counts(self, b, client):
+        return (b.Session.call_count, b.client.call_count,
+                client.assume_role.call_count, client.get_session_token.call_count)
+
+    def test_source_credentials_failure_makes_no_client_or_call(self):
+        b, client = _staged_boto3(no_credentials=True)
+        r = self._drive(b)
+        self._assert_failed_without_side_effects(
+            r, "(stage=source_credentials, no credentials resolved)")
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_source_session_error_makes_no_client_or_call(self):
+        b, client = _staged_boto3(session_exc=creds_mod.ProfileNotFound(DIAG_SOURCE_PROFILE))
+        r = self._drive(b)
+        self._assert_failed_without_side_effects(r, "(stage=source_credentials, ")
+        self.assertEqual(self._counts(b, client), (1, 0, 0, 0))
+
+    def test_sts_client_failure_makes_no_call(self):
+        b, client = _staged_boto3(client_exc=creds_mod.ProfileNotFound("ambient-profile"))
+        r = self._drive(b)
+        self._assert_failed_without_side_effects(r, "(stage=sts_client, ")
+        self.assertEqual(self._counts(b, client), (1, 1, 0, 0))
+
+    def test_sts_call_failure_makes_exactly_one_call_and_no_write_or_connect(self):
+        for exc in (ClientError(_sts_error_response("AccessDenied", 403), "AssumeRole"),
+                    ClientError(None, "AssumeRole"),
+                    RegionDisabledException(_sts_error_response("RegionDisabledException", 403),
+                                            "AssumeRole"),
+                    EndpointConnectionError("conn " + DIAG_REQUEST_ID)):
+            with self.subTest(exc=type(exc).__name__):
+                b, client = _staged_boto3(call_exc=exc)
+                r = self._drive(b)
+                self._assert_failed_without_side_effects(r, "(stage=sts_call, ")
+                self.assertEqual(self._counts(b, client), (1, 1, 1, 0))
+
+    def test_user_path_sts_call_failure(self):
+        b, client = _staged_boto3(call_exc=ClientError(
+            _sts_error_response("ExpiredToken", 403), "GetSessionToken"))
+        r = self._drive(b, role=False)
+        self._assert_failed_without_side_effects(
+            r, "(stage=sts_call, ClientError code=ExpiredToken operation=GetSessionToken "
+               "http=403)")
+        self.assertEqual(self._counts(b, client), (1, 1, 0, 1))
+
+    def test_success_path_is_unchanged(self):
+        b, client = _staged_boto3()
+        r = self._drive(b)
+        self.assertEqual(r.rc, 0)
+        self.assertEqual(r.mfa.call_count, 1)
+        b.Session.assert_called_once_with(profile_name=DIAG_SOURCE_PROFILE)
+        self.assertEqual(b.client.call_count, 1)
+        args, kwargs = b.client.call_args
+        self.assertEqual(args, ("sts",))
+        self.assertEqual((kwargs["aws_access_key_id"], kwargs["aws_secret_access_key"],
+                          kwargs["aws_session_token"]),
+                         (DIAG_SRC_ACCESS, DIAG_SRC_SECRET, DIAG_SRC_TOKEN))
+        self.assertEqual(kwargs["config"].kwargs.get("retries"), {"total_max_attempts": 1})
+        client.assume_role.assert_called_once_with(
+            RoleArn=DIAG_ROLE_ARN, RoleSessionName=f"{DIAG_PROFILE}-session",
+            DurationSeconds=3600, SerialNumber=DIAG_MFA_SERIAL, TokenCode=DIAG_MFA_CODE)
+        self.assertEqual(r.replace.call_count, 1)        # one atomic credential write
+        self.assertEqual(r.run.call_count, 1)            # one kubeconfig update
+        argv = r.run.call_args[0][0]
+        self.assertEqual(argv[:3], ["aws", "eks", "update-kubeconfig"])
+        self.assertEqual(argv[argv.index("--profile") + 1], f"{DIAG_PROFILE}2auth")
+        self.assertEqual(argv[argv.index("--kubeconfig") + 1], r.kube_path)
+        self.assertIn(f"aws_access_key_id = {ACCESS_KEY}", r.creds_after)
+        self.assertEqual(_failure_lines(r.log), [])
+        for text in (r.log, r.out, r.err):
+            _assert_no_sentinels(self, text, "on success")
+
+    def test_reuse_path_is_unchanged(self):
+        b, client = _staged_boto3()
+        r = self._drive(b, reuse=True)
+        self.assertEqual(r.rc, 0)
+        self.assertEqual(r.mfa.call_count, 0)
+        self.assertEqual(self._counts(b, client), (0, 0, 0, 0))
+        self.assertEqual(r.replace.call_count, 0)
+        self.assertEqual(r.run.call_count, 1)
+        self.assertEqual(r.after, r.before)
+        for text in (r.log, r.out, r.err):
+            _assert_no_sentinels(self, text, "on reuse")
 
 
 if __name__ == "__main__":

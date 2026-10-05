@@ -47,8 +47,19 @@ class _ProfileNotFound(_BotoCoreError):
     pass
 
 
+class _ClientError(Exception):
+    """Stand-in for botocore.exceptions.ClientError(error_response, operation_name)."""
+
+    def __init__(self, error_response, operation_name):
+        self.response = error_response
+        self.operation_name = operation_name
+        super().__init__(f"An error occurred calling {operation_name!r}: {error_response!r}")
+
+
+_ClientError.__name__ = _ClientError.__qualname__ = "ClientError"  # the real botocore class name
 _botocore_exc.BotoCoreError = _BotoCoreError
 _botocore_exc.ProfileNotFound = _ProfileNotFound
+_botocore_exc.ClientError = _ClientError
 _botocore.exceptions = _botocore_exc
 sys.modules.setdefault("botocore", _botocore)
 sys.modules.setdefault("botocore.exceptions", _botocore_exc)
